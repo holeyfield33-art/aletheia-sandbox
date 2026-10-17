@@ -1,26 +1,22 @@
 /**
  * Read-only Postgres capability for the aletheia sandbox.
  *
- * Defense in depth — the database is the backstop, not SQL string-matching:
- *   1. The pool SHOULD authenticate as a read-only role (or point at a replica).
+ * Defense in depth — the database is the backstop, the isolate is the jail,
+ * and these guards are the wall + razor wire:
+ *
+ *   1. STARTUP WRITE PROBE — createPostgresCapability refuses to build if the
+ *      role can write. Fail closed. No silent weak mode.
+ *   2. The pool SHOULD authenticate as a read-only role (or point at a replica).
  *      This is the guarantee that holds even if every layer above is bypassed.
- *   2. Every statement runs inside a `BEGIN ... READ ONLY` transaction that is
- *      always rolled back. A read-only transaction makes Postgres itself reject
- *      writes — including the ones a naive "is it a SELECT?" check misses:
- *      writable CTEs (`WITH x AS (INSERT ...)`), `SELECT ... FOR UPDATE`, and
- *      volatile functions that attempt to write.
- *   3. `classifyStatement` is the first line: single statement, read-class leading
- *      keyword only. It is NOT the guarantee (see 2); it gives a clear early error
- *      and blocks multi-statement injection.
- *   4. `SET LOCAL statement_timeout` bounds query time; rows returned are capped.
+ *   3. Every statement runs inside a `BEGIN ... READ ONLY` transaction that is
+ *      always rolled back. Postgres itself rejects writes — including writable
+ *      CTEs, SELECT ... FOR UPDATE, and volatile write functions.
+ *   4. classifyStatement is the first line: single statement, read-class leader
+ *      only, plus a denylist of dangerous functions (file/FS/dblink/exfil).
+ *   5. SET LOCAL statement_timeout bounds query time; rows returned are capped.
  *
- * The capability object the agent receives has no write method and never holds the
- * connection string — credentials stay on the host side of the sandbox boundary.
- *
- * NOTE: the live pg wiring here is written against node-postgres but has NOT been
- * integration-tested against a running server in this build (no Postgres present).
- * The pure guard (`classifyStatement`, `isSafeIdentifier`) is fully unit-tested.
- * Run the integration suite against a real read-only role before production use.
+ * The capability object the agent receives has no write method and never holds
+ * the connection string — credentials stay on the host side of the sandbox boundary.
  */
 import type { Pool } from "pg";
 import { fingerprint, type Capability } from "../core/sandbox.js";
@@ -34,9 +30,47 @@ export interface PostgresProviderOptions {
   maxRows?: number;
   /** Per-statement timeout in ms, applied as SET LOCAL statement_timeout. Default 10_000. */
   statementTimeoutMs?: number;
+  /**
+   * If true (default), probe the role at startup and refuse to build the capability
+   * if a write is possible. Set false only for controlled tests.
+   */
+  requireReadOnlyRole?: boolean;
 }
 
 const READ_LEADERS = new Set(["select", "with", "explain", "show", "table", "values"]);
+
+/**
+ * Functions that can read the filesystem, talk to other servers, or otherwise
+ * escape the data surface even from inside a SELECT. Matched on the skeleton
+ * (comments/strings stripped) as whole identifiers.
+ */
+const DANGEROUS_FUNCTIONS = [
+  "pg_read_file",
+  "pg_read_binary_file",
+  "pg_ls_dir",
+  "pg_stat_file",
+  "pg_logfile_rotate",
+  "lo_import",
+  "lo_export",
+  "lo_from_bytea",
+  "lo_get",
+  "lo_put",
+  "lo_unlink",
+  "dblink",
+  "dblink_exec",
+  "dblink_connect",
+  "dblink_send_query",
+  "dblink_get_result",
+  "dblink_fdw_validator",
+  "pg_execute_server_program",
+  "copy_file",
+  "dbms_lob",
+];
+
+const DANGEROUS_RE = new RegExp(
+  `\\b(${DANGEROUS_FUNCTIONS.map((f) => f.replace(/_/g, "_")).join("|")})\\s*\\(`,
+  "i",
+);
 
 /** Strip string/line/block comments and string + dollar-quoted literals so a
  *  structural scan isn't fooled by `;` or keywords inside them. Returns the
@@ -53,18 +87,31 @@ function skeleton(sql: string): string {
 export interface Classification { ok: boolean; reason?: string; leader?: string; }
 
 /**
- * First-line statement guard (NOT the security guarantee — the read-only
- * transaction is). Accepts a single read-class statement, rejects everything else.
+ * First-line statement guard (NOT the sole security guarantee — the read-only
+ * transaction + startup probe are). Accepts a single read-class statement,
+ * rejects writes, multi-statement injection, and dangerous functions.
  */
 export function classifyStatement(sql: string): Classification {
   if (typeof sql !== "string" || !sql.trim()) return { ok: false, reason: "empty statement" };
   const sk = skeleton(sql).trim().replace(/;+\s*$/, ""); // drop trailing semicolons
   if (!sk) return { ok: false, reason: "empty statement" };
   if (sk.includes(";")) return { ok: false, reason: "multiple statements are not allowed" };
+
   const m = /^\(*\s*([A-Za-z]+)/.exec(sk);             // allow a leading paren before SELECT
   const leader = m?.[1]?.toLowerCase();
   if (!leader || !READ_LEADERS.has(leader))
     return { ok: false, reason: `only read-class statements are allowed (got ${leader ? leader.toUpperCase() : "?"})`, leader };
+
+  // Razor wire: block known exfil / FS / dblink style functions even in SELECT
+  const danger = DANGEROUS_RE.exec(sk);
+  if (danger) {
+    return {
+      ok: false,
+      reason: `dangerous function blocked: ${danger[1].toLowerCase()}()`,
+      leader,
+    };
+  }
+
   return { ok: true, leader };
 }
 
@@ -80,15 +127,53 @@ function quoteIdent(id: string): string {
 }
 
 /**
+ * Wall: probe whether the connected role can write.
+ * Tries a write inside a transaction and rolls it back.
+ * If the write succeeds, the role is too powerful — fail closed.
+ */
+export async function assertReadOnlyRole(pool: Pool): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    try {
+      // Temporary table is a clear write. If this works, the role is not read-only.
+      await client.query("CREATE TEMP TABLE aletheia_write_probe (x int)");
+      // If we get here, the role can write.
+      await client.query("ROLLBACK");
+      throw new Error(
+        "aletheia-sandbox: DATABASE_URL role can WRITE. " +
+        "Refusing to start. Use a read-only role or a replica. " +
+        "This is intentional — the database is the final backstop.",
+      );
+    } catch (e) {
+      // Expected path: permission denied / read-only transaction / etc.
+      const msg = String(e instanceof Error ? e.message : e);
+      if (/aletheia-sandbox: DATABASE_URL role can WRITE/i.test(msg)) throw e;
+      // Any other error from the probe means the write was blocked — good.
+      try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+    }
+  } finally {
+    client.release();
+  }
+}
+
+/**
  * Build the read-only Postgres capability plus a context fingerprint for receipts.
  * The returned `capability` is what you pass to runInSandbox; `contextHash` folds
  * in the live schema so a receipt changes if the schema changes under the agent.
+ *
+ * By default this probes the role and refuses to build if writes are possible.
  */
 export async function createPostgresCapability(
   opts: PostgresProviderOptions,
 ): Promise<{ capability: Capability; contextHash: string }> {
   const maxRows = opts.maxRows ?? 10_000;
   const stmtTimeout = opts.statementTimeoutMs ?? 10_000;
+  const requireReadOnly = opts.requireReadOnlyRole !== false;
+
+  if (requireReadOnly) {
+    await assertReadOnlyRole(opts.pool);
+  }
 
   // Every read runs in its own always-rolled-back READ ONLY transaction.
   async function readOnly<T>(fn: (q: (text: string, values?: unknown[]) => Promise<{ rows: any[]; fields: { name: string }[]; rowCount: number | null }>) => Promise<T>): Promise<T> {

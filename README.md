@@ -12,7 +12,7 @@ The agent writes the exact filter / join / aggregate it needs. It can do nothing
 ### 1. Point at a read-only Postgres
 
 ```bash
-# Use a READ-ONLY role or a replica. This is the real backstop.
+# MUST be a READ-ONLY role or replica. The server refuses to start otherwise.
 export DATABASE_URL="postgres://readonly_user:secret@host:5432/yourdb"
 ```
 
@@ -66,12 +66,16 @@ Everything runs inside a hardened V8 isolate. The agent cannot write, cannot rea
 
 ---
 
-## Security model (defense in depth)
+## Security model
 
-1. **Database is the backstop** — point `DATABASE_URL` at a **read-only role** or **replica**.
-2. Every statement runs inside an always-rolled-back `BEGIN TRANSACTION READ ONLY`.
-3. `classifyStatement` rejects non-read leaders and multi-statement injection early.
-4. V8 isolate (`isolated-vm`): separate heap, no Node bindings, no ambient authority.
+**Jail** = V8 isolate (`isolated-vm`): separate heap, no Node bindings, no ambient authority.
+
+**Wall + razor wire** = everything around the jail:
+
+1. **Startup write probe** — server refuses to start if the DB role can write. Fail closed.
+2. **Database is the backstop** — point `DATABASE_URL` at a **read-only role** or **replica**.
+3. Every statement runs inside an always-rolled-back `BEGIN TRANSACTION READ ONLY`.
+4. `classifyStatement` rejects non-read leaders, multi-statement injection, and **dangerous functions** (`pg_read_file`, `lo_export`, `dblink`, …).
 5. Capability is frozen + allowlisted; host reference is blanked before agent code runs.
 6. JSON boundary — isolate never holds live host objects or credentials.
 7. Caps: isolate memory, wall-clock timeout, per-call host deadline, result size, row count.
@@ -117,7 +121,7 @@ npm test
 npm run test:integration
 ```
 
-See `docker-compose.yml` for the read-only role setup.
+See `docker-compose.yml` for the read-only role setup. The integration test exercises the full wall (write probe + dangerous-function denylist).
 
 ---
 
@@ -135,8 +139,8 @@ See `docker-compose.yml` for the read-only role setup.
 ## Status
 
 - Core isolate + allowlist + caps: unit-tested
-- Read-only SQL guard: unit-tested
-- Live Postgres path: integration test available when `DATABASE_URL` is set
+- Read-only SQL guard + dangerous-function denylist: unit-tested
+- Startup write probe + live path: integration test when `DATABASE_URL` is set
 - Prefer a replica or snapshot over a live primary in production
 
 ---

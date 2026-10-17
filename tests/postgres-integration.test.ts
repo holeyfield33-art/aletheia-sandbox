@@ -9,9 +9,11 @@
  *   npm run test:integration
  *
  * Verifies:
+ *   - startup write probe accepts a true read-only role
  *   - schema / query / sample / explain work through the full sandbox path
  *   - writes are rejected by the classifier and by the READ ONLY transaction
  *   - multi-statement injection is rejected
+ *   - dangerous functions are rejected
  *   - receipt is present and stable for the same code + schema
  */
 import assert from "node:assert";
@@ -30,11 +32,13 @@ const main = async () => {
   const pool = new pg.Pool({ connectionString: url, max: 2 });
 
   try {
+    // Wall: this must succeed only for a true read-only role
     const { capability, contextHash } = await createPostgresCapability({
       pool,
       identity: "integration@test",
       maxRows: 100,
       statementTimeoutMs: 5_000,
+      requireReadOnlyRole: true,
     });
 
     const run = (code: string) =>
@@ -89,14 +93,21 @@ const main = async () => {
     const multi = await run(`return db.query("SELECT 1; DROP TABLE users");`);
     assert.strictEqual(multi.ok, false, "multi-statement rejected");
 
-    // 9) receipt present and stable
+    // 9) dangerous function rejected (razor wire)
+    const danger = await run(`return db.query("SELECT pg_read_file('/etc/passwd')");`);
+    assert.strictEqual(danger.ok, false, "pg_read_file rejected");
+    assert.ok(/dangerous function/i.test(danger.error || ""), "dangerous function named");
+
+    // 10) receipt present and stable
     const a = await run(`return 1;`);
     const b = await run(`return 1;`);
     assert.ok(a.receipt?.hash, "receipt present");
     assert.strictEqual(a.receipt.hash, b.receipt.hash, "same code+context => same receipt");
 
-    console.log("postgres-integration.test: live read-only path holds " +
-      "(schema/query/sample/explain, writes + multi-statement rejected, receipt stable)");
+    console.log(
+      "postgres-integration.test: wall + razor wire hold " +
+        "(read-only probe, schema/query/sample/explain, writes + multi-statement + dangerous funcs rejected, receipt stable)",
+    );
   } finally {
     await pool.end();
   }

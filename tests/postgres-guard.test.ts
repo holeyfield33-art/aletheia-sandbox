@@ -1,10 +1,10 @@
 /**
- * Read-only guard proof (no database needed). classifyStatement is the first line
- * of defense — it must accept read-class statements, reject writes, and above all
- * reject multi-statement injection even when `;` or keywords are hidden in strings
- * or comments. (The always-rolled-back READ ONLY transaction is the actual
- * guarantee for writable-CTE / FOR UPDATE / volatile-write cases; this guard is
- * the clear early error.)
+ * Read-only guard proof (no database needed).
+ * classifyStatement is the wall + razor wire in front of the READ ONLY transaction:
+ *   - accept read-class statements
+ *   - reject writes
+ *   - reject multi-statement injection (even when `;` hides in strings/comments)
+ *   - reject dangerous functions (file/FS/dblink/exfil) even inside SELECT
  */
 import assert from "node:assert";
 import { classifyStatement, isSafeIdentifier } from "../src/providers/postgres.js";
@@ -24,6 +24,7 @@ ok("(SELECT 1)");
 ok("-- a comment\nSELECT 1");
 ok("/* banner */ SELECT 1");
 ok("SELECT 1;");                               // single trailing semicolon is fine
+ok("SELECT count(*) FROM orders WHERE status = 'paid'");
 
 // writes rejected by the leader check
 no("INSERT INTO t VALUES (1)");
@@ -52,6 +53,15 @@ ok("SELECT $tag$ a ; b $tag$ AS v");
 // and a real write hidden after a string-with-semicolon is still caught
 no("SELECT 'a;b'; DELETE FROM t");
 
+// Razor wire: dangerous functions blocked even inside SELECT
+no("SELECT pg_read_file('/etc/passwd')");
+no("SELECT pg_read_binary_file('/etc/passwd')");
+no("SELECT * FROM pg_ls_dir('/tmp')");
+no("SELECT lo_export(123, '/tmp/out')");
+no("SELECT dblink('dbname=other', 'select 1')");
+no("SELECT pg_stat_file('/var/lib/postgresql')");
+no("select PG_READ_FILE('/etc/passwd')"); // case insensitive
+
 // identifier guard for sample()
 assert.ok(isSafeIdentifier("users"));
 assert.ok(isSafeIdentifier("public.users"));
@@ -61,5 +71,6 @@ assert.ok(!isSafeIdentifier("a.b.c"));
 assert.ok(!isSafeIdentifier(""));
 assert.ok(!isSafeIdentifier('"users"'));
 
-console.log("postgres-guard.test: read-class allowed, writes + multi-statement injection rejected " +
-  "(semicolons/keywords in strings & comments handled), identifier guard holds");
+console.log(
+  "postgres-guard.test: read-class allowed; writes + multi-statement + dangerous functions rejected; identifier guard holds",
+);

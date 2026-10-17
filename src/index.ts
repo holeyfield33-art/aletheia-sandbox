@@ -19,6 +19,7 @@ export {
   createPostgresCapability,
   classifyStatement,
   isSafeIdentifier,
+  assertReadOnlyRole,
   type PostgresProviderOptions,
   type Classification,
 } from "./providers/postgres.js";
