@@ -2,7 +2,7 @@
  * aletheia-sandbox: run untrusted agent code against a frozen, read-only
  * capability — one programmable tool instead of N fixed ones, with the security
  * in the jail (V8 isolate, no ambient authority, allowlisted host calls, resource
- * + result caps, replayable receipt) rather than the capability's shape.
+ * + result caps, whole-run budget, replayable + result-bound receipts).
  */
 export {
   runInSandbox,
@@ -20,6 +20,7 @@ export {
   classifyStatement,
   isSafeIdentifier,
   assertReadOnlyRole,
+  skeleton,
   type PostgresProviderOptions,
   type Classification,
 } from "./providers/postgres.js";
