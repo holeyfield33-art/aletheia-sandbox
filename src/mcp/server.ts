@@ -14,6 +14,8 @@
  *
  * Point DATABASE_URL at a READ-ONLY role or a replica. No exceptions for v1.
  */
+import { realpathSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -74,7 +76,20 @@ async function main() {
   console.error(`aletheia-sandbox-pg ready (stdio) — target ${targetIdentity(url)} [read-only role verified]`);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+/**
+ * Run when invoked as a script OR as the installed bin. argv[1] may be a relative
+ * path or a symlink (node_modules/.bin), so resolve both sides to a real file URL
+ * before comparing — the naive `file://${argv[1]}` check misses the symlinked bin
+ * and the server would exit silently.
+ */
+function invokedDirectly(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try { return import.meta.url === pathToFileURL(realpathSync(entry)).href; }
+  catch { return false; }
+}
+
+if (invokedDirectly()) {
   main().catch((e) => {
     console.error(String(e instanceof Error ? e.message : e));
     process.exit(1);
