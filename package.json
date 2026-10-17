@@ -1,20 +1,56 @@
 {
   "name": "aletheia-sandbox",
   "version": "0.1.0",
-  "description": "Run untrusted agent code against a frozen, read-only capability inside a hardened V8 isolate — one programmable tool, security in the jail. Core + read-only Postgres provider.",
-  "main": "dist/index.js",
-  "directories": {
-    "test": "tests"
-  },
-  "scripts": {
-    "test": "tsx tests/core.test.ts && tsx tests/postgres-guard.test.ts",
-    "build": "tsc",
-    "typecheck": "tsc --noEmit"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "Apache-2.0",
+  "description": "One programmable, read-only tool for agents. Run untrusted code against a frozen capability inside a hardened V8 isolate. Core + ready-made Postgres MCP server.",
   "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "aletheia-sandbox-pg": "./dist/mcp/server.js"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx tests/core.test.ts && tsx tests/postgres-guard.test.ts",
+    "test:integration": "tsx tests/postgres-integration.test.ts",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "mcp",
+    "agent",
+    "sandbox",
+    "isolate",
+    "postgres",
+    "read-only",
+    "tool",
+    "security",
+    "v8",
+    "aletheia"
+  ],
+  "author": "holeyfield33-art",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/holeyfield33-art/aletheia-sandbox.git"
+  },
+  "bugs": {
+    "url": "https://github.com/holeyfield33-art/aletheia-sandbox/issues"
+  },
+  "homepage": "https://github.com/holeyfield33-art/aletheia-sandbox#readme",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
     "isolated-vm": "^5.0.1",
@@ -26,9 +62,5 @@
     "@types/pg": "^8.11.10",
     "tsx": "^4.19.2",
     "typescript": "^5.6.3"
-  },
-  "types": "dist/index.d.ts",
-  "bin": {
-    "aletheia-sandbox-pg": "dist/mcp/server.js"
   }
 }
