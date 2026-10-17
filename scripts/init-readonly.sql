@@ -50,3 +50,20 @@ GRANT CONNECT ON DATABASE sandbox TO writable;
 GRANT USAGE, CREATE ON SCHEMA public TO writable;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO writable;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO writable;
+
+-- Writable ONLY through an automatically-updatable VIEW (no base-table grant):
+-- the probe must still refuse it (write privilege on a view persists writes).
+CREATE VIEW public.users_v AS SELECT id, name, email FROM public.users;
+CREATE ROLE writable_view WITH LOGIN PASSWORD 'writable_view' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+GRANT CONNECT ON DATABASE sandbox TO writable_view;
+GRANT USAGE ON SCHEMA public TO writable_view;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.users_v TO writable_view;
+GRANT USAGE, SELECT ON SEQUENCE public.users_id_seq TO writable_view;
+
+-- CREATE on the DATABASE (but not the CREATEDB attribute, no schema grant):
+-- the probe must refuse it (it can add a schema then write there).
+CREATE ROLE writable_dbcreate WITH LOGIN PASSWORD 'writable_dbcreate' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+GRANT CONNECT ON DATABASE sandbox TO writable_dbcreate;
+GRANT CREATE ON DATABASE sandbox TO writable_dbcreate;
+GRANT USAGE ON SCHEMA public TO writable_dbcreate;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO writable_dbcreate;

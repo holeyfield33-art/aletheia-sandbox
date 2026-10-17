@@ -46,6 +46,19 @@ const main = async () => {
     });
     console.log("F1: read-only role ACCEPTED by startup probe");
 
+    // every writable variant must be refused (base-table, view-only, db-CREATE)
+    const mustRefuse = async (url: string, label: string) => {
+      const p = new pg.Pool({ connectionString: url, max: 1 });
+      let refused = false;
+      try { await assertReadOnlyRole(p); }
+      catch (e) { refused = true; assert.ok(/write|create|refus/i.test(String(e)), `${label} refusal names the reason`); }
+      finally { await p.end(); }
+      assert.strictEqual(refused, true, `F1: ${label} REFUSED by startup probe`);
+      console.log(`F1: ${label} REFUSED by startup probe`);
+    };
+    if (process.env.DATABASE_URL_WRITABLE_VIEW) await mustRefuse(process.env.DATABASE_URL_WRITABLE_VIEW, "writable-via-view role");
+    if (process.env.DATABASE_URL_DBCREATE) await mustRefuse(process.env.DATABASE_URL_DBCREATE, "db-CREATE role");
+
     if (rwUrl) {
       const rwPool = new pg.Pool({ connectionString: rwUrl, max: 2 });
       let refused = false;

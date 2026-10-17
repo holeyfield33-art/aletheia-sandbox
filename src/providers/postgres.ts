@@ -179,16 +179,24 @@ export async function assertReadOnlyRole(pool: Pool): Promise<void> {
     if (a && (a.rolsuper || a.rolcreatedb || a.rolcreaterole))
       throw new RoleCanWrite("role has elevated attributes (superuser/createdb/createrole)");
 
+    // Write privilege on ANY user relation the role can target — base tables,
+    // automatically-updatable VIEWS, and FOREIGN tables all persist writes.
+    // TRUNCATE is a base-table-only privilege, so it is guarded to BASE TABLE.
     const w = await client.query(
       `SELECT count(*)::int AS n FROM information_schema.tables t
         WHERE t.table_schema NOT IN ('pg_catalog','information_schema')
-          AND t.table_type = 'BASE TABLE'
+          AND t.table_type IN ('BASE TABLE','VIEW','FOREIGN')
           AND (has_table_privilege(format('%I.%I', t.table_schema, t.table_name), 'INSERT')
             OR has_table_privilege(format('%I.%I', t.table_schema, t.table_name), 'UPDATE')
             OR has_table_privilege(format('%I.%I', t.table_schema, t.table_name), 'DELETE')
-            OR has_table_privilege(format('%I.%I', t.table_schema, t.table_name), 'TRUNCATE'))`,
+            OR (t.table_type = 'BASE TABLE'
+                AND has_table_privilege(format('%I.%I', t.table_schema, t.table_name), 'TRUNCATE')))`,
     );
-    if ((w.rows[0]?.n ?? 0) > 0) throw new RoleCanWrite(`role has write privilege on ${w.rows[0].n} table(s)`);
+    if ((w.rows[0]?.n ?? 0) > 0) throw new RoleCanWrite(`role has write privilege on ${w.rows[0].n} relation(s)`);
+
+    // CREATE on the current database lets the role add a schema and write in it.
+    const db = await client.query(`SELECT has_database_privilege(current_database(), 'CREATE') AS can_create`);
+    if (db.rows[0]?.can_create) throw new RoleCanWrite("role has CREATE on the current database");
 
     const c = await client.query(
       `SELECT count(*)::int AS n FROM information_schema.schemata s

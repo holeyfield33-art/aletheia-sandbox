@@ -64,6 +64,8 @@ jobs:
         env:
           DATABASE_URL: postgres://readonly:readonly@localhost:5432/sandbox
           DATABASE_URL_WRITABLE: postgres://writable:writable@localhost:5432/sandbox
+          DATABASE_URL_WRITABLE_VIEW: postgres://writable_view:writable_view@localhost:5432/sandbox
+          DATABASE_URL_DBCREATE: postgres://writable_dbcreate:writable_dbcreate@localhost:5432/sandbox
         run: npm run test:integration
 
   # Package smoke: install the packed tarball and drive the installed binary via MCP.

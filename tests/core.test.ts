@@ -99,6 +99,13 @@ const main = async () => {
   assert.strictEqual(chain.ok, false, "a long chain of host calls is cut off by the whole-run budget");
   assert.ok(/run budget exceeded/.test(chain.error || ""), "run budget named");
 
+  // 11c) backward compat: a caller passing an OLD limits object without
+  // runBudgetMs must NOT be disposed instantly (the field defaults, not NaN).
+  const legacyLimits = { timeoutMs: 5_000, hostCallTimeoutMs: 15_000, memoryMb: 128, maxCodeChars: 20_000, maxResultBytes: 1_000_000 };
+  const legacy = await run(`return db.query("x").rows.length;`, legacyLimits as any);
+  assert.strictEqual(legacy.ok, true, "a legacy 5-field limits object still runs (runBudgetMs defaulted, not NaN)");
+  assert.strictEqual(legacy.result, 3, "legacy-limits run returns the real result");
+
   // 12) RESULT-BOUND receipt: same code+context but a DIFFERENT result => different
   // receipt hash, while the request identity (requestHash) stays the same.
   counterState = 0;

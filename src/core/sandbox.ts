@@ -147,6 +147,10 @@ export async function runInSandbox(
   limits: SandboxLimits = DEFAULT_LIMITS,
   selector = "aletheia-sandbox-v1",
 ): Promise<ExecResult> {
+  // Merge with defaults so a caller passing an older/partial limits object (e.g.
+  // compiled JS from before a field existed) can't leave one undefined — a missing
+  // runBudgetMs would otherwise make setTimeout fire at ~0ms and dispose instantly.
+  limits = { ...DEFAULT_LIMITS, ...limits };
   const codeHash = sha(code);
   const requestHash = sha(JSON.stringify({ selector, codeHash, contextHash }));
   const mk = (outcome: { ok: boolean; result?: unknown; error?: string }): ExecResult => {

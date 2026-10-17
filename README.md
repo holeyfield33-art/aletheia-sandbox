@@ -25,9 +25,10 @@ The agent writes the exact filter / join / aggregate it needs. It can do nothing
 Pre-1.0 and **not yet published to npm.** Install from source or a release tarball:
 
 ```bash
-# from a built release tarball (npm pack)
+# from a built release tarball (npm pack) — ships prebuilt dist/
 npm install ./aletheia-sandbox-0.1.0.tgz
-# or straight from GitHub
+# or straight from GitHub — a `prepare` script compiles dist/ on install
+# (so the native toolchain above is required for the Git install)
 npm install github:holeyfield33-art/aletheia-sandbox
 ```
 
