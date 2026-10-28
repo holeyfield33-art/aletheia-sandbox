@@ -24,7 +24,9 @@
     "typecheck": "tsc --noEmit",
     "test": "tsx tests/core.test.ts && tsx tests/postgres-guard.test.ts",
     "test:integration": "tsx tests/postgres-integration.test.ts",
-    "prepublishOnly": "npm run build && npm test"
+    "prepublishOnly": "npm run build && npm test",
+    "test:smoke": "node scripts/mcp-smoke.mjs",
+    "prepare": "npm run build"
   },
   "keywords": [
     "mcp",
@@ -55,6 +57,7 @@
     "@modelcontextprotocol/sdk": "^1.32.1",
     "isolated-vm": "^5.0.1",
     "pg": "^8.13.1",
+    "pg-cursor": "^2.11.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {

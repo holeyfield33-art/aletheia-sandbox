@@ -1,95 +1,134 @@
 /**
  * Read-only Postgres capability for the aletheia sandbox.
  *
- * Defense in depth — the database is the backstop, the isolate is the jail,
- * and these guards are the wall + razor wire:
+ * Defense in depth — the database is the backstop, the isolate is the jail, and
+ * these guards are the wall + razor wire:
  *
- *   1. STARTUP WRITE PROBE — createPostgresCapability refuses to build if the
- *      role can write. Fail closed. No silent weak mode.
- *   2. The pool SHOULD authenticate as a read-only role (or point at a replica).
- *      This is the guarantee that holds even if every layer above is bypassed.
- *   3. Every statement runs inside a `BEGIN ... READ ONLY` transaction that is
- *      always rolled back. Postgres itself rejects writes — including writable
- *      CTEs, SELECT ... FOR UPDATE, and volatile write functions.
- *   4. classifyStatement is the first line: single statement, read-class leader
- *      only, plus a denylist of dangerous functions (file/FS/dblink/exfil).
- *   5. SET LOCAL statement_timeout bounds query time; rows returned are capped.
+ *   1. STARTUP WRITE PROBE (assertReadOnlyRole) — refuses to build the capability
+ *      unless the role is provably read-only: no elevated role attributes
+ *      (superuser/createdb/createrole), no INSERT/UPDATE/DELETE/TRUNCATE privilege
+ *      on any user table, and no CREATE on any persistent schema. It inspects the
+ *      catalog rather than attempting a TEMP write (TEMP is granted to PUBLIC, so
+ *      a TEMP probe proves nothing about persistent write). Any unexpected error
+ *      FAILS CLOSED — the server refuses to start rather than assume read-only.
+ *   2. PROTOCOL-LEVEL SINGLE STATEMENT — user SQL runs through the extended query
+ *      protocol (pg-cursor / named prepared statement), so Postgres itself rejects
+ *      "cannot insert multiple commands into a prepared statement". This does not
+ *      depend on regex classification.
+ *   3. READ ONLY TRANSACTION — every statement runs inside `BEGIN ... READ ONLY`,
+ *      always rolled back. Postgres rejects writes (writable CTEs, FOR UPDATE,
+ *      volatile write functions) regardless of the role.
+ *   4. CLASSIFIER (classifyStatement) — defense in depth: a single-pass tokenizer
+ *      strips strings/comments/dollar-quotes without the regex desync bug, then
+ *      requires a read-class leader and blocks a denylist of dangerous functions.
+ *   5. BOUNDED FETCH — rows are read through a cursor up to a cap, so a huge result
+ *      set is never fully materialized in host memory.
+ *   6. SET LOCAL statement_timeout bounds query time.
  *
- * The capability object the agent receives has no write method and never holds
- * the connection string — credentials stay on the host side of the sandbox boundary.
+ * The capability object the agent receives has no write method and never holds the
+ * connection string — credentials stay on the host side of the sandbox boundary.
  */
-import type { Pool } from "pg";
+import { createHash } from "node:crypto";
+import type { Pool, PoolClient } from "pg";
+import Cursor from "pg-cursor";
 import { fingerprint, type Capability } from "../core/sandbox.js";
 
 export interface PostgresProviderOptions {
   /** A node-postgres Pool. Authenticate it as a READ-ONLY role, or point at a replica. */
   pool: Pool;
-  /** A label for the target in receipts/logs — NOT the connection string. e.g. "analytics@replica". */
+  /** A label for the target in receipts/logs — NOT the connection string. */
   identity: string;
-  /** Max rows returned to the agent per query (host memory guard). Default 10_000. */
+  /** Max rows returned to the agent per query (bounded via cursor). Default 10_000. */
   maxRows?: number;
   /** Per-statement timeout in ms, applied as SET LOCAL statement_timeout. Default 10_000. */
   statementTimeoutMs?: number;
-  /**
-   * If true (default), probe the role at startup and refuse to build the capability
-   * if a write is possible. Set false only for controlled tests.
-   */
+  /** If true (default), probe the role at startup and refuse to build if it can write. */
   requireReadOnlyRole?: boolean;
 }
 
 const READ_LEADERS = new Set(["select", "with", "explain", "show", "table", "values"]);
 
-/**
- * Functions that can read the filesystem, talk to other servers, or otherwise
- * escape the data surface even from inside a SELECT. Matched on the skeleton
- * (comments/strings stripped) as whole identifiers.
- */
+/** Functions that can read the filesystem, talk to other servers, or otherwise
+ *  escape the data surface even from inside a SELECT. */
 const DANGEROUS_FUNCTIONS = [
-  "pg_read_file",
-  "pg_read_binary_file",
-  "pg_ls_dir",
-  "pg_stat_file",
-  "pg_logfile_rotate",
-  "lo_import",
-  "lo_export",
-  "lo_from_bytea",
-  "lo_get",
-  "lo_put",
-  "lo_unlink",
-  "dblink",
-  "dblink_exec",
-  "dblink_connect",
-  "dblink_send_query",
-  "dblink_get_result",
-  "dblink_fdw_validator",
-  "pg_execute_server_program",
-  "copy_file",
-  "dbms_lob",
+  "pg_read_file", "pg_read_binary_file", "pg_ls_dir", "pg_stat_file", "pg_logfile_rotate",
+  "lo_import", "lo_export", "lo_from_bytea", "lo_get", "lo_put", "lo_unlink",
+  "dblink", "dblink_exec", "dblink_connect", "dblink_send_query", "dblink_get_result", "dblink_fdw_validator",
+  "pg_execute_server_program", "copy_file", "dbms_lob",
 ];
+const DANGEROUS_RE = new RegExp(`\\b(${DANGEROUS_FUNCTIONS.join("|")})\\s*\\(`, "i");
 
-const DANGEROUS_RE = new RegExp(
-  `\\b(${DANGEROUS_FUNCTIONS.map((f) => f.replace(/_/g, "_")).join("|")})\\s*\\(`,
-  "i",
-);
+/**
+ * Single-pass tokenizer: blank out string literals, line/block comments, and
+ * dollar-quoted strings so a structural scan isn't fooled by `;` or keywords
+ * hidden inside them. Unlike sequential regex replacement, this cannot desync —
+ * a `/*` inside a string literal is never treated as a comment, and a `'` inside
+ * a comment is never treated as a string. Block comments nest (Postgres allows
+ * it). Output is used ONLY for classification, never for execution.
+ */
+export function skeleton(sql: string): string {
+  let out = "";
+  let i = 0;
+  const n = sql.length;
+  while (i < n) {
+    const ch = sql[i];
+    const two = sql.slice(i, i + 2);
 
-/** Strip string/line/block comments and string + dollar-quoted literals so a
- *  structural scan isn't fooled by `;` or keywords inside them. Returns the
- *  "skeleton" used only for classification (never for execution). */
-function skeleton(sql: string): string {
-  let s = sql;
-  s = s.replace(/\/\*[\s\S]*?\*\//g, " ");          // block comments
-  s = s.replace(/--[^\n]*/g, " ");                   // line comments
-  s = s.replace(/'(?:''|[^'])*'/g, "''");            // single-quoted strings
-  s = s.replace(/\$([A-Za-z_]*)\$[\s\S]*?\$\1\$/g, "''"); // dollar-quoted strings
-  return s;
+    // line comment
+    if (two === "--") {
+      i += 2;
+      while (i < n && sql[i] !== "\n") i++;
+      out += " ";
+      continue;
+    }
+    // block comment (nesting)
+    if (two === "/*") {
+      let depth = 1;
+      i += 2;
+      while (i < n && depth > 0) {
+        if (sql.slice(i, i + 2) === "/*") { depth++; i += 2; }
+        else if (sql.slice(i, i + 2) === "*/") { depth--; i += 2; }
+        else i++;
+      }
+      out += " ";
+      continue;
+    }
+    // single-quoted string (with '' escape)
+    if (ch === "'") {
+      i++;
+      while (i < n) {
+        if (sql[i] === "'" && sql[i + 1] === "'") { i += 2; continue; }
+        if (sql[i] === "'") { i++; break; }
+        i++;
+      }
+      out += "''";
+      continue;
+    }
+    // dollar-quoted string: $tag$ ... $tag$  (tag is an optional identifier)
+    if (ch === "$") {
+      const m = /^\$([A-Za-z_][A-Za-z0-9_]*|)\$/.exec(sql.slice(i));
+      if (m) {
+        const tag = m[0];
+        i += tag.length;
+        const end = sql.indexOf(tag, i);
+        i = end === -1 ? n : end + tag.length;
+        out += "''";
+        continue;
+      }
+    }
+    out += ch;
+    i++;
+  }
+  return out;
 }
 
 export interface Classification { ok: boolean; reason?: string; leader?: string; }
 
 /**
- * First-line statement guard (NOT the sole security guarantee — the read-only
- * transaction + startup probe are). Accepts a single read-class statement,
- * rejects writes, multi-statement injection, and dangerous functions.
+ * Defense-in-depth statement guard (the protocol-level single-statement
+ * enforcement in the execution path is the actual guarantee). Accepts a single
+ * read-class statement; rejects writes, transaction control, multi-statement, and
+ * dangerous functions.
  */
 export function classifyStatement(sql: string): Classification {
   if (typeof sql !== "string" || !sql.trim()) return { ok: false, reason: "empty statement" };
@@ -97,73 +136,88 @@ export function classifyStatement(sql: string): Classification {
   if (!sk) return { ok: false, reason: "empty statement" };
   if (sk.includes(";")) return { ok: false, reason: "multiple statements are not allowed" };
 
-  const m = /^\(*\s*([A-Za-z]+)/.exec(sk);             // allow a leading paren before SELECT
+  const m = /^\(*\s*([A-Za-z]+)/.exec(sk); // allow a leading paren before SELECT
   const leader = m?.[1]?.toLowerCase();
   if (!leader || !READ_LEADERS.has(leader))
     return { ok: false, reason: `only read-class statements are allowed (got ${leader ? leader.toUpperCase() : "?"})`, leader };
 
-  // Razor wire: block known exfil / FS / dblink style functions even in SELECT
   const danger = DANGEROUS_RE.exec(sk);
-  if (danger) {
-    return {
-      ok: false,
-      reason: `dangerous function blocked: ${danger[1].toLowerCase()}()`,
-      leader,
-    };
-  }
+  if (danger) return { ok: false, reason: `dangerous function blocked: ${danger[1].toLowerCase()}()`, leader };
 
   return { ok: true, leader };
 }
 
-/** A conservative identifier check for `sample(table)`: optional schema.table,
- *  each part a plain SQL identifier. Anything else is rejected rather than quoted. */
+/** Conservative identifier check for `sample(table)`: optional schema.table. */
 export function isSafeIdentifier(id: string): boolean {
   return typeof id === "string" && /^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*)?$/.test(id);
 }
 
 function quoteIdent(id: string): string {
-  // id already validated by isSafeIdentifier; quote each part to preserve case.
   return id.split(".").map((p) => `"${p}"`).join(".");
 }
 
+class RoleCanWrite extends Error {}
+
 /**
- * Wall: probe whether the connected role can write.
- * Tries a write inside a transaction and rolls it back.
- * If the write succeeds, the role is too powerful — fail closed.
+ * Fail-closed startup privilege validation. A role is accepted ONLY if the catalog
+ * proves it cannot write persistently; any unexpected error refuses startup.
+ *
+ * Why catalog inspection instead of a write attempt: CREATE TEMP TABLE is granted
+ * to PUBLIC, so it proves nothing about persistent write; and an INSERT-only role
+ * has no CREATE, so a CREATE attempt would miss it. has_table_privilege /
+ * has_schema_privilege / pg_roles cover attributes, DML grants, and DDL grants
+ * together, and cannot be fooled.
  */
 export async function assertReadOnlyRole(pool: Pool): Promise<void> {
-  const client = await pool.connect();
+  let client: PoolClient | undefined;
   try {
-    await client.query("BEGIN");
-    try {
-      // Temporary table is a clear write. If this works, the role is not read-only.
-      await client.query("CREATE TEMP TABLE aletheia_write_probe (x int)");
-      // If we get here, the role can write.
-      await client.query("ROLLBACK");
-      throw new Error(
-        "aletheia-sandbox: DATABASE_URL role can WRITE. " +
-        "Refusing to start. Use a read-only role or a replica. " +
-        "This is intentional — the database is the final backstop.",
-      );
-    } catch (e) {
-      // Expected path: permission denied / read-only transaction / etc.
-      const msg = String(e instanceof Error ? e.message : e);
-      if (/aletheia-sandbox: DATABASE_URL role can WRITE/i.test(msg)) throw e;
-      // Any other error from the probe means the write was blocked — good.
-      try { await client.query("ROLLBACK"); } catch { /* ignore */ }
-    }
+    client = await pool.connect();
+    const attr = await client.query(
+      `SELECT rolsuper, rolcreatedb, rolcreaterole FROM pg_roles WHERE rolname = current_user`,
+    );
+    const a = attr.rows[0];
+    if (a && (a.rolsuper || a.rolcreatedb || a.rolcreaterole))
+      throw new RoleCanWrite("role has elevated attributes (superuser/createdb/createrole)");
+
+    // Write privilege on ANY user relation the role can target — base tables,
+    // automatically-updatable VIEWS, and FOREIGN tables all persist writes.
+    // TRUNCATE is a base-table-only privilege, so it is guarded to BASE TABLE.
+    const w = await client.query(
+      `SELECT count(*)::int AS n FROM information_schema.tables t
+        WHERE t.table_schema NOT IN ('pg_catalog','information_schema')
+          AND t.table_type IN ('BASE TABLE','VIEW','FOREIGN')
+          AND (has_table_privilege(format('%I.%I', t.table_schema, t.table_name), 'INSERT')
+            OR has_table_privilege(format('%I.%I', t.table_schema, t.table_name), 'UPDATE')
+            OR has_table_privilege(format('%I.%I', t.table_schema, t.table_name), 'DELETE')
+            OR (t.table_type = 'BASE TABLE'
+                AND has_table_privilege(format('%I.%I', t.table_schema, t.table_name), 'TRUNCATE')))`,
+    );
+    if ((w.rows[0]?.n ?? 0) > 0) throw new RoleCanWrite(`role has write privilege on ${w.rows[0].n} relation(s)`);
+
+    // CREATE on the current database lets the role add a schema and write in it.
+    const db = await client.query(`SELECT has_database_privilege(current_database(), 'CREATE') AS can_create`);
+    if (db.rows[0]?.can_create) throw new RoleCanWrite("role has CREATE on the current database");
+
+    const c = await client.query(
+      `SELECT count(*)::int AS n FROM information_schema.schemata s
+        WHERE s.schema_name NOT IN ('pg_catalog','information_schema','pg_toast')
+          AND has_schema_privilege(s.schema_name, 'CREATE')`,
+    );
+    if ((c.rows[0]?.n ?? 0) > 0) throw new RoleCanWrite(`role can CREATE objects in ${c.rows[0].n} schema(s)`);
+  } catch (e) {
+    if (e instanceof RoleCanWrite)
+      throw new Error(`aletheia-sandbox: ${e.message}. Refusing to start — use a read-only role or a replica.`);
+    // Unexpected error — fail CLOSED, never assume read-only.
+    throw new Error(
+      `aletheia-sandbox: could not verify the role is read-only (${String(e instanceof Error ? e.message : e)}). Refusing to start.`,
+    );
   } finally {
-    client.release();
+    client?.release();
   }
 }
 
-/**
- * Build the read-only Postgres capability plus a context fingerprint for receipts.
- * The returned `capability` is what you pass to runInSandbox; `contextHash` folds
- * in the live schema so a receipt changes if the schema changes under the agent.
- *
- * By default this probes the role and refuses to build if writes are possible.
- */
+export interface QueryResult { rows: any[]; fields: { name: string }[]; truncated: boolean; rowCount: number; }
+
 export async function createPostgresCapability(
   opts: PostgresProviderOptions,
 ): Promise<{ capability: Capability; contextHash: string }> {
@@ -171,30 +225,39 @@ export async function createPostgresCapability(
   const stmtTimeout = opts.statementTimeoutMs ?? 10_000;
   const requireReadOnly = opts.requireReadOnlyRole !== false;
 
-  if (requireReadOnly) {
-    await assertReadOnlyRole(opts.pool);
-  }
+  if (requireReadOnly) await assertReadOnlyRole(opts.pool);
 
-  // Every read runs in its own always-rolled-back READ ONLY transaction.
-  async function readOnly<T>(fn: (q: (text: string, values?: unknown[]) => Promise<{ rows: any[]; fields: { name: string }[]; rowCount: number | null }>) => Promise<T>): Promise<T> {
+  /** Run fn inside an always-rolled-back READ ONLY transaction with a statement timeout. */
+  async function readOnly<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await opts.pool.connect();
     try {
       await client.query("BEGIN TRANSACTION READ ONLY");
       await client.query(`SET LOCAL statement_timeout = ${Number(stmtTimeout)}`);
-      const q = async (text: string, values?: unknown[]) => {
-        const res = await client.query({ text, values });
-        return { rows: res.rows, fields: (res.fields ?? []).map((f) => ({ name: f.name })), rowCount: res.rowCount };
-      };
-      return await fn(q);
+      return await fn(client);
     } finally {
       try { await client.query("ROLLBACK"); } catch { /* connection already gone */ }
       client.release();
     }
   }
 
+  /** Bounded read via cursor (extended protocol → single-statement enforced by
+   *  Postgres; rows fetched up to the cap, never the whole set). */
+  function readLimited(client: PoolClient, text: string, values: unknown[]): Promise<QueryResult> {
+    return new Promise((resolve, reject) => {
+      const cursor = client.query(new Cursor(text, values));
+      cursor.read(maxRows + 1, (err: Error | undefined, rows: any[], result: any) => {
+        if (err) { cursor.close(() => {}); reject(err); return; }
+        const truncated = rows.length > maxRows;
+        const out = truncated ? rows.slice(0, maxRows) : rows;
+        const fields = ((result?.fields ?? []) as { name: string }[]).map((f) => ({ name: f.name }));
+        cursor.close(() => resolve({ rows: out, fields, truncated, rowCount: out.length }));
+      });
+    });
+  }
+
   async function loadSchema() {
-    return readOnly(async (q) => {
-      const cols = await q(
+    return readOnly(async (client) => {
+      const cols = await client.query(
         `SELECT table_schema, table_name, column_name, data_type, is_nullable
            FROM information_schema.columns
           WHERE table_schema NOT IN ('pg_catalog','information_schema')
@@ -215,46 +278,39 @@ export async function createPostgresCapability(
   const tableKeys = new Set(schema.map((t) => `${t.schema}.${t.name}`));
   const contextHash = fingerprint({ identity: opts.identity, schema });
 
-  const cap = (rows: any[]) => {
-    const truncated = rows.length > maxRows;
-    return { rows: truncated ? rows.slice(0, maxRows) : rows, truncated, rowCount: rows.length };
-  };
-
   const methods = {
-    /** Full column-level schema of the database (comment-free, read-only). */
+    /** Full column-level schema of the database. */
     schema: () => schema,
 
-    /** Run a single read-class SQL statement with optional parameters; returns capped rows. */
+    /** Run a single read-class SQL statement with optional parameters; bounded rows. */
     query: async (sql: unknown, params?: unknown) => {
       if (typeof sql !== "string") throw new Error("query(sql, params?) expects a SQL string");
       const cls = classifyStatement(sql);
       if (!cls.ok) throw new Error("rejected: " + cls.reason);
-      const values = Array.isArray(params) ? (params as unknown[]) : undefined;
-      return readOnly(async (q) => {
-        const res = await q(sql, values);
-        return { ...cap(res.rows), fields: res.fields };
-      });
+      const values = Array.isArray(params) ? (params as unknown[]) : [];
+      // Cursor path enforces single-statement at the protocol level AND bounds rows.
+      return readOnly((client) => readLimited(client, sql, values));
     },
 
-    /** Sample up to n rows from a table (validated identifier, read-only). */
+    /** Sample up to n rows from a validated table (read-only, bounded). */
     sample: async (table: unknown, n?: unknown) => {
       if (!isSafeIdentifier(String(table))) throw new Error("invalid table identifier");
       const key = String(table).includes(".") ? String(table) : `public.${table}`;
       if (!tableKeys.has(key)) throw new Error(`unknown table: ${table}`);
       const lim = Math.max(1, Math.min(Number(n) || 50, maxRows));
-      return readOnly(async (q) => {
-        const res = await q(`SELECT * FROM ${quoteIdent(String(table))} LIMIT ${lim}`);
-        return { ...cap(res.rows), fields: res.fields };
-      });
+      return readOnly((client) => readLimited(client, `SELECT * FROM ${quoteIdent(String(table))} LIMIT ${lim}`, []));
     },
 
-    /** EXPLAIN (FORMAT JSON) a read-class statement without executing its effects. */
+    /** EXPLAIN (FORMAT JSON) a read-class statement. Named prepared statement →
+     *  Postgres rejects multiple commands at Parse (protocol-level single stmt). */
     explain: async (sql: unknown) => {
       if (typeof sql !== "string") throw new Error("explain(sql) expects a SQL string");
       const cls = classifyStatement(sql);
       if (!cls.ok) throw new Error("rejected: " + cls.reason);
-      return readOnly(async (q) => {
-        const res = await q(`EXPLAIN (FORMAT JSON) ${sql}`);
+      return readOnly(async (client) => {
+        const text = `EXPLAIN (FORMAT JSON) ${sql}`;
+        const name = "aletheia_x_" + createHash("sha256").update(text).digest("hex").slice(0, 24);
+        const res = await client.query({ name, text, values: [] });
         return res.rows?.[0]?.["QUERY PLAN"] ?? res.rows;
       });
     },

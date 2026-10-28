@@ -12,12 +12,15 @@ import { runInSandbox, DEFAULT_LIMITS, fingerprint, type Capability } from "../s
 // A mock read-only capability: an async "query" (simulates a DB round-trip), a
 // sync "schema", and a "hang" that never resolves (to exercise the host deadline).
 const rows = [{ id: 1, name: "a" }, { id: 2, name: "b" }, { id: 3, name: "a" }];
+let counterState = 0;
 const cap: Capability = {
   namespace: "db",
   methods: {
     query: async (sql: unknown) => { await new Promise((r) => setTimeout(r, 5)); return { sql, rows }; },
     schema: () => ({ tables: ["users", "orders"] }),
     hang: () => new Promise(() => { /* never resolves */ }),
+    sleep: async (ms: unknown) => { await new Promise((r) => setTimeout(r, Number(ms))); return Number(ms); },
+    counter: () => ++counterState, // same code can yield different results → tests result-binding
   },
 };
 const CTX = fingerprint({ db: "mock", schema: "v1" });
@@ -53,7 +56,7 @@ const main = async () => {
   const noHost = await run(`return typeof __ALETHEIA_HOST__;`);
   assert.strictEqual(noHost.result, "undefined", "the host capability reference is not reachable");
   const surface = await run(`return Object.keys(db).sort().join(",") + "|" + typeof db.evil;`);
-  assert.strictEqual(surface.result, "hang,query,schema|undefined", "only the provided methods exist on the capability");
+  assert.strictEqual(surface.result, "counter,hang,query,schema,sleep|undefined", "only the provided methods exist on the capability");
 
   // 6) JAIL: in-isolate wall-clock timeout kills a busy loop
   const spin = await run(`while (true) {}`, { ...DEFAULT_LIMITS, timeoutMs: 200 });
@@ -81,9 +84,47 @@ const main = async () => {
   assert.strictEqual(bad.ok, false, "syntax error returns ok:false");
   assert.ok(bad.receipt?.hash, "receipt present on failure");
 
+  // 11) WHOLE-RUN budget cancels a tight in-isolate loop even when timeoutMs is huge
+  const t0 = Date.now();
+  const budgetLoop = await run(`while (true) {}`, { ...DEFAULT_LIMITS, timeoutMs: 10_000, runBudgetMs: 400 });
+  assert.strictEqual(budgetLoop.ok, false, "run budget cancels the loop");
+  assert.ok(/run budget|time/i.test(budgetLoop.error || ""), "budget/timeout reported");
+  assert.ok(Date.now() - t0 < 3_000, "cancellation happened near the 400ms budget, not the 10s timeout");
+
+  // 11b) WHOLE-RUN budget bounds a long CHAIN of host calls (per-call deadline is generous)
+  const chain = await run(
+    `for (let i = 0; i < 100; i++) { db.sleep(100); } return "done";`,
+    { ...DEFAULT_LIMITS, runBudgetMs: 500, hostCallTimeoutMs: 10_000 },
+  );
+  assert.strictEqual(chain.ok, false, "a long chain of host calls is cut off by the whole-run budget");
+  assert.ok(/run budget exceeded/.test(chain.error || ""), "run budget named");
+
+  // 11c) backward compat: a caller passing an OLD limits object without
+  // runBudgetMs must NOT be disposed instantly (the field defaults, not NaN).
+  const legacyLimits = { timeoutMs: 5_000, hostCallTimeoutMs: 15_000, memoryMb: 128, maxCodeChars: 20_000, maxResultBytes: 1_000_000 };
+  const legacy = await run(`return db.query("x").rows.length;`, legacyLimits as any);
+  assert.strictEqual(legacy.ok, true, "a legacy 5-field limits object still runs (runBudgetMs defaulted, not NaN)");
+  assert.strictEqual(legacy.result, 3, "legacy-limits run returns the real result");
+
+  // 12) RESULT-BOUND receipt: same code+context but a DIFFERENT result => different
+  // receipt hash, while the request identity (requestHash) stays the same.
+  counterState = 0;
+  const c1 = await run(`return db.counter();`);
+  const c2 = await run(`return db.counter();`);
+  assert.strictEqual(c1.result, 1);
+  assert.strictEqual(c2.result, 2);
+  assert.strictEqual(c1.receipt.requestHash, c2.receipt.requestHash, "same code+context => same request identity");
+  assert.notStrictEqual(c1.receipt.resultHash, c2.receipt.resultHash, "different result => different resultHash");
+  assert.notStrictEqual(c1.receipt.hash, c2.receipt.hash, "different result => different binding hash");
+  // identical code AND identical result => identical everything
+  const d1 = await run(`return 7;`);
+  const d2 = await run(`return 7;`);
+  assert.strictEqual(d1.receipt.hash, d2.receipt.hash, "same code+context+result => same receipt");
+  assert.strictEqual(d1.receipt.resultHash, d2.receipt.resultHash, "same result => same resultHash");
+
   console.log("core.test: generalized sandbox — async + sync capability bridge, agent-shaped join, " +
-    "replayable receipt; jail holds (no ambient authority, host unreachable, allowlist-only surface, " +
-    "isolate timeout + host-call deadline + memory + result caps, fail-closed)");
+    "result-bound receipt; jail holds (no ambient authority, host unreachable, allowlist-only surface, " +
+    "isolate timeout + host-call deadline + whole-run budget + memory + result caps, fail-closed)");
 };
 
 main().catch((e) => { console.error(e); process.exit(1); });

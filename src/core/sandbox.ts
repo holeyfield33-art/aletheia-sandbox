@@ -23,19 +23,22 @@
  *     live reference to a host object, connection, or credential;
  *   - results are serialized and size-checked INSIDE the isolate before being
  *     copied out, so a huge return cannot blow the host heap;
- *   - an isolate memory cap and a wall-clock timeout bound in-isolate compute,
- *     and a per-call host deadline bounds each (possibly async) capability call,
- *     since an isolate timeout does not fire while the isolate is parked awaiting
- *     the host.
+ *   - an isolate memory cap and an in-isolate wall-clock timeout bound compute, a
+ *     per-call host deadline bounds each (possibly async) capability call, and a
+ *     WHOLE-RUN budget bounds the entire invocation — when it is exceeded the
+ *     isolate is disposed (hard cancellation), so neither a loop that never calls
+ *     out nor a long chain of host calls can run unbounded.
  *
  * Capability methods may be async (e.g. a database round-trip). Inside the isolate
  * the agent calls them synchronously (`db.query(sql)`); the core bridges that to
  * the async host method and blocks the isolate until it resolves.
  *
- * Every run returns a replayable receipt: sha256(selector + code + contextHash),
- * where contextHash is a stable fingerprint of the data surface the caller passes
- * in (e.g. a database's schema + identity). Same code + same surface => same
- * receipt.
+ * Every run returns a RESULT-BOUND receipt: sha256 over selector + code +
+ * contextHash + resultHash, where resultHash is a hash of the actual output (or
+ * the error). Two runs of the same code over the same surface that produced the
+ * same result share a receipt; a run that produced a different result does not.
+ * The request identity (selector+code+contextHash) is also exposed separately for
+ * replay bookkeeping.
  */
 import { createHash } from "node:crypto";
 import ivm from "isolated-vm";
@@ -54,6 +57,9 @@ export interface SandboxLimits {
   timeoutMs: number;
   /** Deadline for a single host (capability) call, ms — bounds a slow async method. */
   hostCallTimeoutMs: number;
+  /** Whole-run budget, ms: the entire invocation (compute + all host calls). When
+   *  exceeded the isolate is disposed, cancelling the run. */
+  runBudgetMs: number;
   /** Isolate heap cap, MB. */
   memoryMb: number;
   /** Max length of agent code, chars. */
@@ -65,6 +71,7 @@ export interface SandboxLimits {
 export const DEFAULT_LIMITS: SandboxLimits = {
   timeoutMs: 5_000,
   hostCallTimeoutMs: 15_000,
+  runBudgetMs: 30_000,
   memoryMb: 128,
   maxCodeChars: 20_000,
   maxResultBytes: 1_000_000,
@@ -74,6 +81,11 @@ export interface Receipt {
   selector: string;
   codeHash: string;
   contextHash: string;
+  /** Hash of the actual result (or of the error on failure) — makes the receipt result-bound. */
+  resultHash: string;
+  /** Identity of the request alone (selector+code+contextHash), independent of the result. */
+  requestHash: string;
+  /** The binding hash over selector+code+contextHash+resultHash. */
   hash: string;
 }
 
@@ -90,9 +102,6 @@ const sha = (s: string) => "sha256:" + createHash("sha256").update(s).digest("he
 const IDENT = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 
 function bootstrap(namespace: string, methodNames: string[]): string {
-  // Build the frozen namespace object. Each method forwards to the single host
-  // reference via applySyncPromise (sync-looking, resolves the host's async
-  // result). The host dispatches by name against the allowlist on its side.
   const entries = methodNames
     .map((m) => `${JSON.stringify(m)}: function(){ return __call(${JSON.stringify(m)}, Array.prototype.slice.call(arguments)); }`)
     .join(",\n        ");
@@ -113,9 +122,6 @@ function bootstrap(namespace: string, methodNames: string[]): string {
 }
 
 function wrapUser(code: string, maxResultBytes: number): string {
-  // Async IIFE so the agent can use the (sync-looking) capability calls and a
-  // top-level `return`. Serialize + size-check the result inside the isolate;
-  // only the bounded JSON string is copied out.
   return `(async function(){
 "use strict";
 var __r = await (async function(){
@@ -131,8 +137,8 @@ return __s;
 /**
  * Run agent code against a capability inside a hardened isolate.
  * Never throws for sandbox-level failures (timeout, memory, bad code, a blocked
- * or failed capability call) — those come back as { ok:false, error }. The
- * receipt is always present.
+ * or failed capability call, run-budget exhaustion) — those come back as
+ * { ok:false, error }. The receipt is always present and result-bound.
  */
 export async function runInSandbox(
   capability: Capability,
@@ -141,33 +147,49 @@ export async function runInSandbox(
   limits: SandboxLimits = DEFAULT_LIMITS,
   selector = "aletheia-sandbox-v1",
 ): Promise<ExecResult> {
+  // Merge with defaults so a caller passing an older/partial limits object (e.g.
+  // compiled JS from before a field existed) can't leave one undefined — a missing
+  // runBudgetMs would otherwise make setTimeout fire at ~0ms and dispose instantly.
+  limits = { ...DEFAULT_LIMITS, ...limits };
   const codeHash = sha(code);
-  const receiptCore = { selector, codeHash, contextHash };
-  const receipt: Receipt = { ...receiptCore, hash: sha(JSON.stringify(receiptCore)) };
-  const base = {
-    receipt,
-    note: `Read-only sandbox: code ran in an isolate with no network, filesystem, require, or host scope — only a frozen \`${capability.namespace}\` capability. Replayable: same code + context => same receipt hash.`,
+  const requestHash = sha(JSON.stringify({ selector, codeHash, contextHash }));
+  const mk = (outcome: { ok: boolean; result?: unknown; error?: string }): ExecResult => {
+    const resultHash = outcome.ok ? sha("ok:" + JSON.stringify(outcome.result ?? null)) : sha("err:" + String(outcome.error ?? ""));
+    const hash = sha(JSON.stringify({ selector, codeHash, contextHash, resultHash }));
+    return {
+      ok: outcome.ok,
+      ...(outcome.ok ? { result: outcome.result } : { error: outcome.error }),
+      receipt: { selector, codeHash, contextHash, resultHash, requestHash, hash },
+      note: `Read-only sandbox: code ran in an isolate with no network, filesystem, require, or host scope — only a frozen \`${capability.namespace}\` capability. Receipt is result-bound (sha of selector+code+context+result).`,
+    };
   };
 
-  if (!IDENT.test(capability.namespace))
-    return { ok: false, error: "invalid capability namespace", ...base };
-  if (typeof code !== "string" || code.length === 0)
-    return { ok: false, error: "empty code", ...base };
-  if (code.length > limits.maxCodeChars)
-    return { ok: false, error: `code exceeds ${limits.maxCodeChars} chars`, ...base };
+  if (!IDENT.test(capability.namespace)) return mk({ ok: false, error: "invalid capability namespace" });
+  if (typeof code !== "string" || code.length === 0) return mk({ ok: false, error: "empty code" });
+  if (code.length > limits.maxCodeChars) return mk({ ok: false, error: `code exceeds ${limits.maxCodeChars} chars` });
 
   const allowed = new Set(Object.keys(capability.methods));
+  const runDeadline = Date.now() + limits.runBudgetMs;
 
-  // The one capability handed into the isolate: an async dispatcher. Every call
-  // is allowlist-checked here, on the host, and bounded by a per-call deadline so
-  // a hung async method (e.g. a stuck DB query) cannot park the isolate forever.
+  // The one capability handed into the isolate: an async dispatcher. Every call is
+  // allowlist-checked here, bounded by a per-call deadline AND by the remaining
+  // whole-run budget, so neither a slow method nor a long chain can run forever.
   const host = new ivm.Reference(async (method: string, argsJson: string): Promise<string | undefined> => {
     if (!allowed.has(method)) throw new Error("method not permitted: " + String(method));
+    const remaining = runDeadline - Date.now();
+    if (remaining <= 0) throw new Error(`run budget exceeded (${limits.runBudgetMs} ms)`);
     const args = JSON.parse(argsJson) as unknown[];
     const call = Promise.resolve(capability.methods[method](...args));
+    const perCall = Math.min(limits.hostCallTimeoutMs, remaining);
+    // If the remaining whole-run budget is the binding constraint (shorter than the
+    // per-call timeout), label the cutoff as a budget exhaustion, not a slow call.
+    const budgetBound = remaining < limits.hostCallTimeoutMs;
+    const deadlineMsg = budgetBound
+      ? `run budget exceeded (${limits.runBudgetMs} ms)`
+      : `host call '${method}' exceeded ${perCall} ms`;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_, rej) => {
-      timer = setTimeout(() => rej(new Error(`host call '${method}' exceeded ${limits.hostCallTimeoutMs} ms`)), limits.hostCallTimeoutMs);
+      timer = setTimeout(() => rej(new Error(deadlineMsg)), perCall);
     });
     try {
       const out = await Promise.race([call, deadline]);
@@ -178,6 +200,12 @@ export async function runInSandbox(
   });
 
   const isolate = new ivm.Isolate({ memoryLimit: limits.memoryMb });
+  // Hard cancellation: if the whole-run budget elapses, dispose the isolate. This
+  // kills a tight in-isolate loop that never calls out (the in-isolate timeout
+  // would also catch that) AND a run stuck across host calls.
+  let budgetTimer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => {
+    try { if (!isolate.isDisposed) isolate.dispose(); } catch { /* already gone */ }
+  }, limits.runBudgetMs);
   try {
     const context = await isolate.createContext();
     await context.global.set("__ALETHEIA_HOST__", host);
@@ -187,10 +215,14 @@ export async function runInSandbox(
       promise: true,
       copy: true,
     })) as string;
-    return { ok: true, result: JSON.parse(json), ...base };
+    return mk({ ok: true, result: JSON.parse(json) });
   } catch (e) {
-    return { ok: false, error: String(e instanceof Error ? e.message : e), ...base };
+    const msg = String(e instanceof Error ? e.message : e);
+    // A dispose triggered by the run-budget timer surfaces as an isolate-disposed error.
+    const budgetHit = Date.now() >= runDeadline || /isolate (is|was) disposed/i.test(msg);
+    return mk({ ok: false, error: budgetHit && /dispos/i.test(msg) ? `run budget exceeded (${limits.runBudgetMs} ms)` : msg });
   } finally {
+    if (budgetTimer) { clearTimeout(budgetTimer); budgetTimer = undefined; }
     try { host.release(); } catch { /* released with the isolate */ }
     try { if (!isolate.isDisposed) isolate.dispose(); } catch { /* already disposed */ }
   }
